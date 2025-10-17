@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 """
-ord_scraper_render_webhook_final.py
+Render Web Service FastDL Scraper
 
-FastDL scraper optimized for Render deployment:
-- ord_ prefix
+- ord_ prefix maps
 - batch progress every 5000 attempts
-- non-interactive, uses env var MAP_LENGTH
-- Discord webhook notifications:
-    - periodic progress every 20 minutes
-    - found maps with file attachment
-    - completion message when scraping finishes
-- Checkpointing to resume
+- Discord webhook notifications
+- HTTP server for Render health checks
 """
 
 import os
@@ -22,6 +17,8 @@ from datetime import datetime
 import aiohttp
 import bz2
 import json
+import threading
+from aiohttp import web
 
 # ================= CONFIG =================
 BASE_URL = "http://169.150.249.133/fastdl/teamfortress2/679d9656b8573d37aa848d60/maps/"
@@ -31,37 +28,37 @@ DELAY = 0.0
 EXTENSIONS = [".bsp.bz2", ".bsp"]
 CHARSET = string.ascii_lowercase + string.digits
 TIMEOUT = 20
-BATCH_SIZE = 5000   # batch size for logging
+BATCH_SIZE = 5000
 CHECKPOINT_FILE = "checkpoint.json"
-STATUS_INTERVAL = 20 * 60  # 20 minutes in seconds
-# Discord Webhook
+STATUS_INTERVAL = 20 * 60  # 20 minutes
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 MAP_LENGTH = int(os.getenv("MAP_LENGTH", "5"))
 # ==========================================
 
 os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
+# ---------- Utility ----------
 def timestamped_name(name: str) -> str:
     now = datetime.now()
     base, ext = os.path.splitext(name)
     ts = f"{now.day:02d}{now.month:02d}{now.year}{now.hour:02d}{now.minute:02d}{now.second:02d}"
     return f"{ts}_{base}{ext}"
 
-# ---------------- Checkpointing ----------------
+# ---------- Checkpoint ----------
 def load_checkpoint():
     if os.path.exists(CHECKPOINT_FILE):
         try:
             with open(CHECKPOINT_FILE, "r") as f:
                 return json.load(f)
         except:
-            return {"count": 0, "batch": 0}
-    return {"count": 0, "batch": 0}
+            return {"count":0,"batch":0}
+    return {"count":0,"batch":0}
 
 def save_checkpoint(counter):
     with open(CHECKPOINT_FILE, "w") as f:
         json.dump(counter, f)
 
-# ---------------- Discord ----------------
+# ---------- Discord ----------
 async def notify_discord(message: str, file_path: str = None):
     if not DISCORD_WEBHOOK:
         return
@@ -77,7 +74,7 @@ async def notify_discord(message: str, file_path: str = None):
         except:
             pass
 
-# ---------------- Scraper ----------------
+# ---------- Scraper ----------
 async def try_name(session: aiohttp.ClientSession, name: str):
     full_base = f"ord_{name}"
     for ext in EXTENSIONS:
@@ -91,7 +88,7 @@ async def try_name(session: aiohttp.ClientSession, name: str):
                     with open(local_path, "wb") as f:
                         f.write(data)
 
-                    # decompress if .bz2
+                    # decompress .bz2
                     if local_path.endswith(".bz2"):
                         out_path = local_path[:-4]
                         with open(local_path, "rb") as f:
@@ -111,7 +108,6 @@ async def try_name(session: aiohttp.ClientSession, name: str):
         if DELAY > 0:
             await asyncio.sleep(DELAY)
 
-# ---------------- Worker ----------------
 async def worker(name_queue: asyncio.Queue, session: aiohttp.ClientSession, counter, total_combinations):
     while not name_queue.empty():
         name = await name_queue.get()
@@ -125,23 +121,21 @@ async def worker(name_queue: asyncio.Queue, session: aiohttp.ClientSession, coun
 
         name_queue.task_done()
 
-# ---------------- Status notifier ----------------
+# ---------- Status Notifier ----------
 async def status_notifier(counter, total_combinations):
     while True:
         await asyncio.sleep(STATUS_INTERVAL)
-        percent = (counter["count"] / total_combinations) * 100
+        percent = (counter["count"]/total_combinations)*100
         msg = f"⏱ Scraping progress: {percent:.2f}% ({counter['count']:,}/{total_combinations:,})"
         print(msg)
         await notify_discord(msg)
 
-# ---------------- Main ----------------
-async def main():
-    print(f"[+] Using map character length: {MAP_LENGTH}")
+# ---------- Main Scraper ----------
+async def scraper_main():
     counter = load_checkpoint()
     name_queue = asyncio.Queue()
     total_combinations = len(CHARSET) ** MAP_LENGTH
 
-    # skip already attempted combinations
     current_index = 0
     for combo in product(CHARSET, repeat=MAP_LENGTH):
         if current_index >= counter["count"]:
@@ -149,9 +143,7 @@ async def main():
         current_index += 1
 
     async with aiohttp.ClientSession() as session:
-        # start status notifier
         asyncio.create_task(status_notifier(counter, total_combinations))
-        # start workers
         tasks = [asyncio.create_task(worker(name_queue, session, counter, total_combinations)) for _ in range(CONCURRENCY)]
         await name_queue.join()
         for t in tasks:
@@ -162,5 +154,23 @@ async def main():
     print(completion_msg)
     await notify_discord(completion_msg)
 
+# ---------- Web Server ----------
+async def health(request):
+    return web.Response(text="Scraper is running")
+
+def start_web_service():
+    app = web.Application()
+    app.add_routes([web.get('/', health)])
+    PORT = int(os.getenv("PORT", 10000))
+    web.run_app(app, port=PORT)
+
+# ---------- Background Scraper ----------
+def start_scraper():
+    asyncio.run(scraper_main())
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Run scraper in background thread
+    import threading
+    threading.Thread(target=start_scraper, daemon=True).start()
+    # Start web service for Render health
+    start_web_service()
