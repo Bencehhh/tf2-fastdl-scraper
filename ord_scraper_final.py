@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 Render Web Service FastDL Scraper (English Words)
+
 - Scrapes maps with ord_ prefix
-- Tries only valid English words of given length
-- Prints + sends Discord webhook when map is found
-- Sends status updates every 20 min
-- Lightweight (no map list stored in memory)
+- Only tries valid English words of a given length
+- Sends Discord notifications immediately when a map is found
+- Periodic status updates every 20 minutes
+- Minimal memory usage (streaming downloads)
+- Web server for health checks
 """
 
 import os
@@ -26,48 +28,64 @@ EXTENSIONS = [".bsp.bz2", ".bsp"]
 TIMEOUT = 20
 BATCH_SIZE = 5000
 CHECKPOINT_FILE = "checkpoint.json"
-STATUS_INTERVAL = 60 * 20  # every 20 minutes
+STATUS_INTERVAL = 20 * 60  # 20 minutes
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 MAP_LENGTH = int(os.getenv("MAP_LENGTH", "5"))
-WORD_LIST_FILE = "words_alpha.txt"  # must exist in repo
+WORD_LIST_FILE = "words_alpha.txt"  # English word list
 # ==========================================
 
 os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
-# ---------- Utilities ----------
-def timestamped_name(name: str) -> str:
-    now = datetime.now()
-    base, ext = os.path.splitext(name)
-    ts = f"{now:%d%m%Y%H%M%S}"
-    return f"{ts}_{base}{ext}"
-
+# ---------- Checkpoint ----------
 def load_checkpoint():
     if os.path.exists(CHECKPOINT_FILE):
         try:
             with open(CHECKPOINT_FILE, "r") as f:
                 return json.load(f)
         except:
-            pass
+            return {"count": 0, "batch": 0, "index": 0}
     return {"count": 0, "batch": 0, "index": 0}
 
 def save_checkpoint(counter):
     with open(CHECKPOINT_FILE, "w") as f:
         json.dump(counter, f)
 
+# ---------- Timestamped filenames ----------
+def timestamped_name(name: str) -> str:
+    now = datetime.now()
+    base, ext = os.path.splitext(name)
+    ts = f"{now.day:02d}{now.month:02d}{now.year}{now.hour:02d}{now.minute:02d}{now.second:02d}"
+    return f"{ts}_{base}{ext}"
+
+# ---------- Discord Notifications ----------
 async def notify_discord(message: str, file_path: str = None):
     if not DISCORD_WEBHOOK:
+        print("[!] No DISCORD_WEBHOOK set")
         return
-    async with aiohttp.ClientSession() as session:
-        try:
+    try:
+        async with aiohttp.ClientSession() as session:
             if file_path and os.path.exists(file_path):
                 form = aiohttp.FormData()
                 form.add_field('file', open(file_path, 'rb'), filename=os.path.basename(file_path))
                 form.add_field('content', message)
-                await session.post(DISCORD_WEBHOOK, data=form)
+                resp = await session.post(DISCORD_WEBHOOK, data=form)
             else:
-                await session.post(DISCORD_WEBHOOK, json={"content": message})
-        except Exception as e:
-            print(f"[!] Discord notification failed: {e}")
+                resp = await session.post(DISCORD_WEBHOOK, json={"content": message})
+
+            # Handle rate limits
+            if resp.status == 429:
+                data = await resp.json()
+                retry_after = data.get("retry_after", 1)
+                print(f"[!] Rate limited. Retrying after {retry_after} seconds")
+                await asyncio.sleep(retry_after)
+                await notify_discord(message, file_path)
+            elif resp.status != 204:
+                text = await resp.text()
+                print(f"[!] Webhook failed: {resp.status} → {text}")
+            else:
+                print(f"[+] Webhook sent: {message}")
+    except Exception as e:
+        print(f"[!] Discord notification failed: {e}")
 
 # ---------- Scraper ----------
 async def try_word(session: aiohttp.ClientSession, word: str):
@@ -79,11 +97,11 @@ async def try_word(session: aiohttp.ClientSession, word: str):
             async with session.get(url, timeout=TIMEOUT) as resp:
                 if resp.status == 200:
                     local_path = os.path.join(ARCHIVE_DIR, filename)
-                    # Stream file to disk
+                    # Streaming download to save RAM
                     with open(local_path, "wb") as f:
                         async for chunk in resp.content.iter_chunked(8192):
                             f.write(chunk)
-                    # Decompress bz2 if needed
+                    # Decompress if needed
                     if local_path.endswith(".bz2"):
                         out_path = local_path[:-4]
                         with open(local_path, "rb") as fin, open(out_path, "wb") as fout:
@@ -93,30 +111,30 @@ async def try_word(session: aiohttp.ClientSession, word: str):
                         os.remove(local_path)
                         local_path = out_path
                         filename = filename[:-4]
-                    # Rename archived file
                     final_name = timestamped_name(os.path.basename(local_path))
-                    archived_path = os.path.join(ARCHIVE_DIR, final_name)
-                    os.rename(local_path, archived_path)
-                    # Log and notify
+                    final_path = os.path.join(ARCHIVE_DIR, final_name)
+                    os.rename(local_path, final_path)
+
                     print(f"[+] FOUND MAP: {filename} → archived as {final_name}")
-                    await notify_discord(f"✅ Found map: **{filename}**")
+                    # Immediate notification for found map
+                    await notify_discord(f"✅ FOUND MAP: {filename}", final_path)
         except:
             pass
         if DELAY > 0:
             await asyncio.sleep(DELAY)
 
+# ---------- Scraper Main ----------
 async def scraper_main():
     counter = load_checkpoint()
 
-    # Load only words of target length
+    # Load filtered English words of target length
     with open(WORD_LIST_FILE, "r") as f:
         words = [w.strip() for w in f if len(w.strip()) == MAP_LENGTH]
-
     total_words = len(words)
-    print(f"[+] Total {total_words:,} English words of length {MAP_LENGTH}")
+    print(f"[+] Total {total_words} English words of length {MAP_LENGTH}")
 
     async with aiohttp.ClientSession() as session:
-
+        # Periodic progress notifier
         async def status_notifier():
             while True:
                 await asyncio.sleep(STATUS_INTERVAL)
@@ -126,8 +144,8 @@ async def scraper_main():
                 await notify_discord(msg)
 
         asyncio.create_task(status_notifier())
-        semaphore = asyncio.Semaphore(CONCURRENCY)
 
+        semaphore = asyncio.Semaphore(CONCURRENCY)
         for i in range(counter.get("index", 0), total_words):
             word = words[i]
             async with semaphore:
@@ -140,13 +158,13 @@ async def scraper_main():
                 save_checkpoint(counter)
 
     save_checkpoint(counter)
-    done_msg = f"🎉 Scraping finished for length {MAP_LENGTH}! Total attempts: {counter['count']:,}"
-    print(done_msg)
-    await notify_discord(done_msg)
+    msg = f"🎉 Scraping finished for length {MAP_LENGTH}! Total attempts: {counter['count']:,}"
+    print(msg)
+    await notify_discord(msg)
 
-# ---------- Health check Web Server ----------
+# ---------- Health Check Server ----------
 async def health(request):
-    return web.Response(text="✅ Scraper is running")
+    return web.Response(text="Scraper is running")
 
 def start_web_service():
     app = web.Application()
@@ -154,7 +172,7 @@ def start_web_service():
     PORT = int(os.getenv("PORT", 10000))
     web.run_app(app, port=PORT)
 
-# ---------- Background Scraper ----------
+# ---------- Run Background Scraper ----------
 def start_scraper():
     asyncio.run(scraper_main())
 
