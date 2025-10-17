@@ -170,7 +170,6 @@ def start_scraper():
 
 if __name__ == "__main__":
     # Run scraper in background thread
-    import threading
     threading.Thread(target=start_scraper, daemon=True).start()
     # Start web service for Render health
     start_web_service()
