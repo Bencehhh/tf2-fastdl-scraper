@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Render Web Service FastDL Scraper
+Render Web Service FastDL Scraper (Memory Optimized)
 
 - ord_ prefix maps
 - batch progress every 5000 attempts
-- Discord webhook notifications
+- prints only FOUND maps
+- streaming decompression to reduce memory
+- generates names on-the-fly (no large queue)
+- limited concurrency to stay under 100 MB
+- Discord webhook notifications for found maps, progress, and completion
 - HTTP server for Render health checks
 """
 
@@ -17,13 +21,13 @@ from datetime import datetime
 import aiohttp
 import bz2
 import json
-import threading
 from aiohttp import web
+import threading
 
 # ================= CONFIG =================
 BASE_URL = "http://169.150.249.133/fastdl/teamfortress2/679d9656b8573d37aa848d60/maps/"
 ARCHIVE_DIR = "archive"
-CONCURRENCY = 80
+CONCURRENCY = 4      # low concurrency for memory
 DELAY = 0.0
 EXTENSIONS = [".bsp.bz2", ".bsp"]
 CHARSET = string.ascii_lowercase + string.digits
@@ -32,7 +36,7 @@ BATCH_SIZE = 5000
 CHECKPOINT_FILE = "checkpoint.json"
 STATUS_INTERVAL = 20 * 60  # 20 minutes
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
-MAP_LENGTH = int(os.getenv("MAP_LENGTH", "5"))
+MAP_LENGTH = int(os.getenv("MAP_LENGTH"))
 # ==========================================
 
 os.makedirs(ARCHIVE_DIR, exist_ok=True)
@@ -83,71 +87,67 @@ async def try_name(session: aiohttp.ClientSession, name: str):
         try:
             async with session.get(url, timeout=TIMEOUT) as resp:
                 if resp.status == 200:
-                    data = await resp.read()
                     local_path = os.path.join(ARCHIVE_DIR, filename)
+                    # Stream download to file
                     with open(local_path, "wb") as f:
-                        f.write(data)
-
-                    # decompress .bz2
+                        async for chunk in resp.content.iter_chunked(8192):
+                            f.write(chunk)
+                    # Streaming bz2 decompression if needed
                     if local_path.endswith(".bz2"):
                         out_path = local_path[:-4]
-                        with open(local_path, "rb") as f:
-                            decompressed = bz2.decompress(f.read())
-                        with open(out_path, "wb") as f:
-                            f.write(decompressed)
+                        with open(local_path, "rb") as fin, open(out_path, "wb") as fout:
+                            decompressor = bz2.BZ2Decompressor()
+                            for chunk in iter(lambda: fin.read(8192), b""):
+                                fout.write(decompressor.decompress(chunk))
                         os.remove(local_path)
                         local_path = out_path
                         filename = filename[:-4]
-
                     final_name = timestamped_name(os.path.basename(local_path))
                     os.rename(local_path, os.path.join(ARCHIVE_DIR, final_name))
                     print(f"[+] FOUND MAP: {filename} → archived as {final_name}")
                     await notify_discord(f"✅ FOUND MAP: {filename}", os.path.join(ARCHIVE_DIR, final_name))
-        except Exception:
+        except:
             pass
         if DELAY > 0:
             await asyncio.sleep(DELAY)
 
-async def worker(name_queue: asyncio.Queue, session: aiohttp.ClientSession, counter, total_combinations):
-    while not name_queue.empty():
-        name = await name_queue.get()
-        await try_name(session, name)
-        counter["count"] += 1
-
-        if counter["count"] % BATCH_SIZE == 0:
-            counter["batch"] += 1
-            print(f"✅ Completed Batch #{counter['batch']} ({counter['count']:,} attempts)")
-            save_checkpoint(counter)
-
-        name_queue.task_done()
-
-# ---------- Status Notifier ----------
-async def status_notifier(counter, total_combinations):
-    while True:
-        await asyncio.sleep(STATUS_INTERVAL)
-        percent = (counter["count"]/total_combinations)*100
-        msg = f"⏱ Scraping progress: {percent:.2f}% ({counter['count']:,}/{total_combinations:,})"
-        print(msg)
-        await notify_discord(msg)
-
-# ---------- Main Scraper ----------
 async def scraper_main():
     counter = load_checkpoint()
-    name_queue = asyncio.Queue()
     total_combinations = len(CHARSET) ** MAP_LENGTH
-
     current_index = 0
-    for combo in product(CHARSET, repeat=MAP_LENGTH):
-        if current_index >= counter["count"]:
-            await name_queue.put("".join(combo))
-        current_index += 1
 
     async with aiohttp.ClientSession() as session:
-        asyncio.create_task(status_notifier(counter, total_combinations))
-        tasks = [asyncio.create_task(worker(name_queue, session, counter, total_combinations)) for _ in range(CONCURRENCY)]
-        await name_queue.join()
-        for t in tasks:
-            t.cancel()
+        # status notifier
+        async def status_notifier():
+            while True:
+                await asyncio.sleep(STATUS_INTERVAL)
+                percent = (counter["count"]/total_combinations)*100
+                msg = f"⏱ Scraping progress: {percent:.2f}% ({counter['count']:,}/{total_combinations:,})"
+                print(msg)
+                await notify_discord(msg)
+        asyncio.create_task(status_notifier())
+
+        # generator for names
+        async def name_generator():
+            nonlocal current_index
+            for combo in product(CHARSET, repeat=MAP_LENGTH):
+                if current_index >= counter["count"]:
+                    yield "".join(combo)
+                current_index += 1
+
+        # limited concurrency tasks
+        semaphore = asyncio.Semaphore(CONCURRENCY)
+        async def worker():
+            async for name in name_generator():
+                async with semaphore:
+                    await try_name(session, name)
+                    counter["count"] +=1
+                    if counter["count"] % BATCH_SIZE == 0:
+                        counter["batch"] +=1
+                        print(f"✅ Completed Batch #{counter['batch']} ({counter['count']:,} attempts)")
+                        save_checkpoint(counter)
+
+        await worker()
 
     save_checkpoint(counter)
     completion_msg = f"🎉 Scraping finished for character length {MAP_LENGTH}! Total attempts: {counter['count']:,}, Total batches: {counter['batch']}"
@@ -169,7 +169,6 @@ def start_scraper():
     asyncio.run(scraper_main())
 
 if __name__ == "__main__":
-    # Run scraper in background thread
+    import threading
     threading.Thread(target=start_scraper, daemon=True).start()
-    # Start web service for Render health
     start_web_service()
