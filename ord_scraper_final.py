@@ -186,28 +186,115 @@ async def scraper_main():
 
 # ---------- Web Server ----------
 async def index(request):
-    found = "<br>".join(status["found_maps"][-10:]) or "None yet"
+    found_html = "<br>".join(status["found_maps"][-10:]) or "None yet"
     percent = (status["count"] / status["total"] * 100) if status["total"] else 0
+
     html = f"""
-    <html><head><title>TF2 FastDL Scraper</title></head><body>
-    <h1>TF2 FastDL Scraper</h1>
-    <p>Map Length: {status['map_length']}</p>
-    <p>Wordlist: {status['wordlist']}</p>
-    <p>Progress: {percent:.2f}% ({status['count']:,}/{status['total']:,})</p>
-    <p>Current Word: {status['current_word']}</p>
-    <p>Batches Completed: {status['batch']}</p>
-    <h3>Recently Found Maps</h3>
-    <div style="background:#f0f0f0;padding:10px;">{found}</div>
-    <form action="/configure" method="post">
-      <p>Map Length: <input type="number" name="map_length" value="{status['map_length']}"></p>
-      <p>Wordlist:
-        <select name="wordlist">
-          {"".join([f'<option value="{w}" {"selected" if w==status["wordlist"] else ""}>{w}</option>' for w in os.listdir(".") if w.endswith(".txt")])}
-        </select>
-      </p>
-      <button type="submit">Restart Scraper</button>
-    </form>
-    </body></html>
+    <html>
+    <head>
+      <title>TF2 FastDL Scraper</title>
+      <style>
+        body {{
+          font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+          background-color: #1e1e1e;
+          color: #f5f5f5;
+          margin: 0;
+          padding: 20px;
+        }}
+        h1 {{
+          color: #ff9800;
+          margin-bottom: 0.5em;
+        }}
+        .card {{
+          background: #2a2a2a;
+          border-radius: 10px;
+          padding: 20px;
+          margin-bottom: 20px;
+          box-shadow: 0px 0px 10px rgba(0,0,0,0.4);
+        }}
+        .progress {{
+          background: #555;
+          border-radius: 10px;
+          overflow: hidden;
+          height: 20px;
+          margin-top: 10px;
+        }}
+        .progress-bar {{
+          background: linear-gradient(90deg, #4caf50, #81c784);
+          height: 100%;
+          width: {percent:.2f}%;
+          transition: width 0.5s;
+        }}
+        .label {{
+          color: #bdbdbd;
+          font-size: 14px;
+          margin-top: 5px;
+        }}
+        .found-maps {{
+          background: #121212;
+          padding: 10px;
+          border-radius: 6px;
+          max-height: 200px;
+          overflow-y: auto;
+          font-family: monospace;
+        }}
+        select, input, button {{
+          padding: 5px 10px;
+          font-size: 14px;
+          border-radius: 5px;
+          border: none;
+          margin-top: 5px;
+        }}
+        button {{
+          background-color: #2196f3;
+          color: white;
+          cursor: pointer;
+          transition: background 0.2s;
+        }}
+        button:hover {{
+          background-color: #1976d2;
+        }}
+        .row {{
+          margin-bottom: 10px;
+        }}
+      </style>
+    </head>
+    <body>
+      <h1>🔥 TF2 FastDL Scraper</h1>
+
+      <div class="card">
+        <div class="row"><strong>Map Length:</strong> {status['map_length']}</div>
+        <div class="row"><strong>Wordlist:</strong> {status['wordlist']}</div>
+        <div class="row"><strong>Progress:</strong> {percent:.2f}% ({status['count']:,}/{status['total']:,})</div>
+        <div class="row"><strong>Current Word:</strong> {status['current_word']}</div>
+        <div class="row"><strong>Batches Completed:</strong> {status['batch']}</div>
+
+        <div class="progress"><div class="progress-bar"></div></div>
+      </div>
+
+      <div class="card">
+        <h3>🗺 Recently Found Maps</h3>
+        <div class="found-maps">{found_html}</div>
+      </div>
+
+      <div class="card">
+        <h3>⚙️ Configuration</h3>
+        <form action="/configure" method="post">
+          <div class="row">
+            Map Length:
+            <input type="number" name="map_length" min="1" value="{status['map_length']}">
+          </div>
+          <div class="row">
+            Wordlist:
+            <select name="wordlist">
+              {"".join([f'<option value="{w}" {"selected" if w==status["wordlist"] else ""}>{w}</option>' for w in os.listdir(".") if w.endswith(".txt")])}
+            </select>
+          </div>
+          <button type="submit">Restart Scraper</button>
+        </form>
+      </div>
+    </body>
+    </html>
     """
     return web.Response(text=html, content_type="text/html")
 
