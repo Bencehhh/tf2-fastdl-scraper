@@ -1,47 +1,70 @@
 #!/usr/bin/env python3
+"""
+Render Web Service FastDL Scraper (Single Scraper Instance)
+
+✅ Features:
+- ord_ prefix map scraping
+- Uses word lists (English dictionaries)
+- Only one scraper runs at a time
+- GUI to configure map length & wordlist
+- Progress display
+- Discord webhook notifications (found maps + progress)
+- Low memory footprint
+- Graceful restart without duplicate threads
+"""
+
 import os
 import asyncio
-from urllib.parse import urljoin
-from datetime import datetime
 import aiohttp
 import bz2
 import json
-from aiohttp import web
 import threading
+from aiohttp import web
+from datetime import datetime
+from urllib.parse import urljoin
 
 # ================= CONFIG =================
 BASE_URL = "http://169.150.249.133/fastdl/teamfortress2/679d9656b8573d37aa848d60/maps/"
 ARCHIVE_DIR = "archive"
-CONCURRENCY = 5
-DELAY = 0.0
 EXTENSIONS = [".bsp.bz2", ".bsp"]
+CONCURRENCY = 5
 TIMEOUT = 20
 BATCH_SIZE = 5000
-CHECKPOINT_FILE = "checkpoint.json"
 STATUS_INTERVAL = 20 * 60  # 20 minutes
+CHECKPOINT_FILE = "checkpoint.json"
+
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
-DEFAULT_MAP_LENGTH = int(os.getenv("MAP_LENGTH", "5"))
-DEFAULT_WORDLIST = os.getenv("WORDLIST", "words_alpha.txt")
+DEFAULT_WORDLIST = "words_alpha.txt"
+DEFAULT_MAP_LENGTH = int(os.getenv("MAP_LENGTH", "4"))
+PORT = int(os.getenv("PORT", "10000"))
 # ==========================================
 
 os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
-# Shared status
+# ---------- Globals ----------
 status = {
-    "current_word": "",
-    "attempts": 0,
-    "batches": 0,
-    "total": 0,
     "map_length": DEFAULT_MAP_LENGTH,
-    "running": False,
-    "start_time": None,
     "wordlist": DEFAULT_WORDLIST,
+    "total": 0,
+    "count": 0,
+    "batch": 0,
+    "running": False,
+    "current_word": "",
+    "found_maps": []
 }
 
-# Scraper control event
-stop_event = asyncio.Event()
+stop_event = threading.Event()
+scraper_thread = None
 
-# ---------- Checkpoint ----------
+
+# ---------- Utilities ----------
+def timestamped_name(name: str) -> str:
+    now = datetime.now()
+    base, ext = os.path.splitext(name)
+    ts = f"{now.day:02d}{now.month:02d}{now.year}{now.hour:02d}{now.minute:02d}{now.second:02d}"
+    return f"{ts}_{base}{ext}"
+
+
 def load_checkpoint():
     if os.path.exists(CHECKPOINT_FILE):
         try:
@@ -51,18 +74,12 @@ def load_checkpoint():
             return {"count": 0, "batch": 0, "index": 0}
     return {"count": 0, "batch": 0, "index": 0}
 
+
 def save_checkpoint(counter):
     with open(CHECKPOINT_FILE, "w") as f:
         json.dump(counter, f)
 
-# ---------- Timestamped filenames ----------
-def timestamped_name(name: str) -> str:
-    now = datetime.now()
-    base, ext = os.path.splitext(name)
-    ts = f"{now.day:02d}{now.month:02d}{now.year}{now.hour:02d}{now.minute:02d}{now.second:02d}"
-    return f"{ts}_{base}{ext}"
 
-# ---------- Discord Notifications ----------
 async def notify_discord(message: str, file_path: str = None):
     if not DISCORD_WEBHOOK:
         return
@@ -72,20 +89,15 @@ async def notify_discord(message: str, file_path: str = None):
                 form = aiohttp.FormData()
                 form.add_field('file', open(file_path, 'rb'), filename=os.path.basename(file_path))
                 form.add_field('content', message)
-                resp = await session.post(DISCORD_WEBHOOK, data=form)
+                await session.post(DISCORD_WEBHOOK, data=form)
             else:
-                resp = await session.post(DISCORD_WEBHOOK, json={"content": message})
-            if resp.status == 429:
-                data = await resp.json()
-                retry_after = data.get("retry_after", 1)
-                await asyncio.sleep(retry_after)
-                await notify_discord(message, file_path)
-    except Exception as e:
-        print(f"[!] Discord notification failed: {e}")
+                await session.post(DISCORD_WEBHOOK, json={"content": message})
+    except:
+        pass
+
 
 # ---------- Scraper ----------
 async def try_word(session: aiohttp.ClientSession, word: str):
-    status["current_word"] = word
     full_base = f"ord_{word.lower()}"
     for ext in EXTENSIONS:
         filename = f"{full_base}{ext}"
@@ -109,134 +121,129 @@ async def try_word(session: aiohttp.ClientSession, word: str):
                     final_name = timestamped_name(os.path.basename(local_path))
                     final_path = os.path.join(ARCHIVE_DIR, final_name)
                     os.rename(local_path, final_path)
-
-                    print(f"[+] FOUND MAP: {filename}")
-                    await notify_discord(f"✅ FOUND MAP: {filename}", final_path)
+                    msg = f"✅ FOUND MAP: {filename}"
+                    print(msg)
+                    status["found_maps"].append(filename)
+                    await notify_discord(msg, final_path)
         except:
             pass
-        if DELAY > 0:
-            await asyncio.sleep(DELAY)
 
-# ---------- Scraper Main ----------
+
 async def scraper_main():
-    stop_event.clear()
-    counter = {"count": 0, "batch": 0, "index": 0}
+    counter = load_checkpoint()
 
-    # Load wordlist
-    if not os.path.exists(status["wordlist"]):
-        print(f"[!] Wordlist file {status['wordlist']} not found!")
-        return
+    # Load selected word list
+    wordlist_file = status["wordlist"]
+    map_length = status["map_length"]
+    with open(wordlist_file, "r") as f:
+        words = [w.strip() for w in f if len(w.strip()) == map_length]
 
-    with open(status["wordlist"], "r") as f:
-        words = [w.strip() for w in f if len(w.strip()) == status["map_length"]]
     total_words = len(words)
     status["total"] = total_words
-    status["attempts"] = 0
-    status["batches"] = 0
-    status["running"] = True
-    status["start_time"] = datetime.now().isoformat()
+    status["count"] = counter["count"]
+    status["batch"] = counter["batch"]
+    print(f"[+] Total {total_words} English words of length {map_length}")
 
-    print(f"[+] Starting scrape of {total_words:,} words from {status['wordlist']} (length {status['map_length']})")
-    await notify_discord(f"🚀 Started scraping {total_words:,} words from `{status['wordlist']}` with length {status['map_length']}")
+    status["running"] = True
 
     async with aiohttp.ClientSession() as session:
-        asyncio.create_task(periodic_status())
+
+        async def status_notifier():
+            while status["running"] and not stop_event.is_set():
+                await asyncio.sleep(STATUS_INTERVAL)
+                percent = (status["count"] / total_words) * 100
+                msg = f"⏱ Progress: {percent:.2f}% ({status['count']:,}/{total_words:,})"
+                print(msg)
+                await notify_discord(msg)
+
+        asyncio.create_task(status_notifier())
         semaphore = asyncio.Semaphore(CONCURRENCY)
-        for i, word in enumerate(words):
+
+        for i in range(counter.get("index", 0), total_words):
             if stop_event.is_set():
+                print("[*] Stop event received. Exiting scraper.")
                 break
+            word = words[i]
+            status["current_word"] = word
             async with semaphore:
                 await try_word(session, word)
-            counter["count"] += 1
-            status["attempts"] = counter["count"]
-            if counter["count"] % BATCH_SIZE == 0:
-                counter["batch"] += 1
-                status["batches"] = counter["batch"]
-                print(f"✅ Completed Batch #{counter['batch']} ({counter['count']:,} attempts)")
+            status["count"] += 1
+            counter["count"] = status["count"]
+            counter["index"] = i + 1
 
+            if status["count"] % BATCH_SIZE == 0:
+                status["batch"] += 1
+                counter["batch"] = status["batch"]
+                save_checkpoint(counter)
+                print(f"✅ Completed Batch #{status['batch']} ({status['count']:,} attempts)")
+
+    save_checkpoint(counter)
     status["running"] = False
-    if not stop_event.is_set():
-        await notify_discord(f"🎉 Scraping finished for `{status['wordlist']}` length {status['map_length']}! Total attempts: {counter['count']:,}")
+    msg = f"🎉 Scraping finished for length {map_length}! Total attempts: {status['count']:,}, Total batches: {status['batch']}"
+    print(msg)
+    await notify_discord(msg)
 
-async def periodic_status():
-    while status["running"] and not stop_event.is_set():
-        await asyncio.sleep(STATUS_INTERVAL)
-        if status["total"] > 0:
-            percent = (status["attempts"] / status["total"]) * 100
-            msg = f"⏱ Progress: {percent:.2f}% ({status['attempts']:,}/{status['total']:,})\nWordlist: {status['wordlist']}"
-            print(msg)
-            await notify_discord(msg)
 
-# ---------- Web UI ----------
-def get_wordlists():
-    return [f for f in os.listdir('.') if f.endswith('.txt')]
-
-async def dashboard(request):
-    percent = (status["attempts"]/status["total"]*100) if status["total"] else 0
-    wordlist_options = "\n".join([
-        f'<option value="{wl}" {"selected" if wl == status["wordlist"] else ""}>{wl}</option>'
-        for wl in get_wordlists()
-    ])
+# ---------- Web Server ----------
+async def index(request):
+    found = "<br>".join(status["found_maps"][-10:]) or "None yet"
+    percent = (status["count"] / status["total"] * 100) if status["total"] else 0
     html = f"""
-    <html>
-      <head>
-        <title>TF2 FastDL Scraper</title>
-        <meta http-equiv="refresh" content="5">
-        <style>
-          body {{ font-family: Arial, sans-serif; padding: 20px; background: #111; color: #eee; }}
-          h1 {{ color: #4CAF50; }}
-          .box {{ background: #222; padding: 10px; border-radius: 5px; margin-top: 10px; }}
-          input, select {{ padding: 5px; margin-top: 5px; }}
-        </style>
-      </head>
-      <body>
-        <h1>TF2 FastDL Scraper</h1>
-        <div class="box">
-          <p>🧠 Status: {"Running" if status['running'] else "Stopped"}</p>
-          <p>📝 Current word: <b>{status['current_word']}</b></p>
-          <p>🚀 Attempts: {status['attempts']:,}/{status['total']:,} ({percent:.2f}%)</p>
-          <p>📦 Batches completed: {status['batches']}</p>
-          <p>🔠 Map length: {status['map_length']}</p>
-          <p>📜 Wordlist: {status['wordlist']}</p>
-          <p>⏳ Started: {status['start_time']}</p>
-        </div>
-        <form action="/configure" method="post" class="box">
-          <label>Map length: <input type="number" name="map_length" min="1" max="25" value="{status['map_length']}"></label><br>
-          <label>Wordlist:
-            <select name="wordlist">{wordlist_options}</select>
-          </label><br><br>
-          <button type="submit">Restart Scraper</button>
-        </form>
-      </body>
-    </html>
+    <html><head><title>TF2 FastDL Scraper</title></head><body>
+    <h1>TF2 FastDL Scraper</h1>
+    <p>Map Length: {status['map_length']}</p>
+    <p>Wordlist: {status['wordlist']}</p>
+    <p>Progress: {percent:.2f}% ({status['count']:,}/{status['total']:,})</p>
+    <p>Current Word: {status['current_word']}</p>
+    <p>Batches Completed: {status['batch']}</p>
+    <h3>Recently Found Maps</h3>
+    <div style="background:#f0f0f0;padding:10px;">{found}</div>
+    <form action="/configure" method="post">
+      <p>Map Length: <input type="number" name="map_length" value="{status['map_length']}"></p>
+      <p>Wordlist:
+        <select name="wordlist">
+          {"".join([f'<option value="{w}" {"selected" if w==status["wordlist"] else ""}>{w}</option>' for w in os.listdir(".") if w.endswith(".txt")])}
+        </select>
+      </p>
+      <button type="submit">Restart Scraper</button>
+    </form>
+    </body></html>
     """
     return web.Response(text=html, content_type="text/html")
 
-# ---------- Web endpoints ----------
+
 async def configure(request):
     data = await request.post()
     map_length = int(data.get("map_length", status["map_length"]))
     wordlist = data.get("wordlist", status["wordlist"])
+
     status["map_length"] = map_length
     status["wordlist"] = wordlist
-
-    if status["running"]:
-        stop_event.set()
-
-    # restart scraper in new thread
-    threading.Thread(target=lambda: asyncio.run(scraper_main()), daemon=True).start()
+    start_scraper()
     return web.HTTPFound('/')
+
 
 def start_web_service():
     app = web.Application()
-    app.add_routes([
-        web.get('/', dashboard),
-        web.post('/configure', configure)
-    ])
-    PORT = int(os.getenv("PORT", 10000))
+    app.add_routes([web.get('/', index), web.post('/configure', configure)])
     web.run_app(app, port=PORT)
 
-# ---------- Run ----------
+
+# ---------- Scraper Thread ----------
+def start_scraper():
+    global scraper_thread
+    if scraper_thread and scraper_thread.is_alive():
+        print("[*] Stopping old scraper thread...")
+        stop_event.set()
+        scraper_thread.join(timeout=10)
+
+    stop_event.clear()
+    scraper_thread = threading.Thread(target=lambda: asyncio.run(scraper_main()), daemon=True)
+    scraper_thread.start()
+    print("[+] Scraper started")
+
+
+# ---------- Main ----------
 if __name__ == "__main__":
-    threading.Thread(target=lambda: asyncio.run(scraper_main()), daemon=True).start()
+    start_scraper()
     start_web_service()
